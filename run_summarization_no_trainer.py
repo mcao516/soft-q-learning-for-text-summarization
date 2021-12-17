@@ -37,8 +37,19 @@ from transformers import (
 from transformers.file_utils import is_offline_mode
 from transformers.utils.versions import require_version
 
+from soft_q_loss import SoftQLearningCriterion
 from data_utils import get_raw_dataset, process_raw_dataset, postprocess_text
 
+_has_wandb = False
+try:
+    import wandb
+
+    _has_wandb = True
+except:
+    logger.warning(
+        "W&B logger is not installed, \
+        for advanced logging please install using pip install wandb"
+    )
 
 logger = logging.getLogger(__name__)
 require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/summarization/requirements.txt")
@@ -226,6 +237,37 @@ def parse_args():
         default="~/.cache/huggingface/datasets",
         help="Cache directory for datasets."
     )
+    parser.add_argument(
+        "--job_name",
+        type=str,
+        default="kd_experiment",
+        help="W&B job name."
+    )
+    parser.add_argument(
+        "--project_name",
+        type=str,
+        default="summarization-kd",
+        help="W&B project name."
+    )
+
+    # soft-Q loss arguments
+    parser.add_argument('--label-smoothing', default=0., type=float, metavar='D',
+                        help='epsilon for label smoothing, 0 means no label smoothing')
+    parser.add_argument('--reward-shaping', action='store_true',
+                        help='Whether use reward shaping')
+    parser.add_argument('--old-r-min', default=0., type=float,
+                        help='Original minimum reward value')
+    parser.add_argument('--old-r-max', default=1.0, type=float,
+                        help='Original maximum reward value')
+    parser.add_argument('--new-r-min', default=-0.5, type=float,
+                        help='Minimum reward value after reshaping')
+    parser.add_argument('--new-r-max', default=0.5, type=float,
+                        help='Maximum reward value after reshaping')
+    parser.add_argument('--gamma-pcl', default=1.0, type=float,
+                        help='Reward discount factor')
+    parser.add_argument('--tau-pcl', default=1.0, type=float,
+                        help='Shannon entropy coefficient in PCL')
+
     args = parser.parse_args()
 
     # Sanity checks
@@ -240,6 +282,35 @@ def parse_args():
             assert extension in ["csv", "json"], "`validation_file` should be a csv or a json file."
 
     return args
+
+
+def setup_wandb(args, model, resume_id=None):
+    if _has_wandb:
+        if resume_id is not None:
+            wandb.init(
+                project=args.project_name,
+                group=args.job_name,
+                dir="./",
+                resume="allow",
+                id=resume_id,
+            )
+        else:
+            wandb.init(project=args.project_name, group=args.job_name, dir="./")
+        wandb.config.update(args, allow_val_change=True)
+        wandb.watch(model)
+    else:
+        logger.info("W&B library not installed. Using only CLI logging.")
+
+
+def report_metrics(lr, loss, step):
+    current_lr = lr[0] if type(lr) == list else lr
+
+    if _has_wandb:
+        log_info = {
+            f"train/lr": current_lr,
+            f"train/train_loss": loss,
+        }
+        wandb.log(log_info, step=step)
 
 
 def load_pretrained_model_and_tokenizer(
@@ -399,9 +470,23 @@ def main():
         use_slow_tokenizer=args.use_slow_tokenizer
     )
 
+    _, _, tgt_model = load_pretrained_model_and_tokenizer(
+        args.model_name_or_path,
+        args.config_name,
+        args.tokenizer_name,
+        model_type=args.model_type,
+        use_slow_tokenizer=args.use_slow_tokenizer
+    )
+
     model.resize_token_embeddings(len(tokenizer))
+    tgt_model.resize_token_embeddings(len(tokenizer))
+
     if model.config.decoder_start_token_id is None:
         raise ValueError("Make sure that `config.decoder_start_token_id` is correctly defined")
+
+    # setup W&B logging
+    if accelerator.is_main_process:
+        setup_wandb(args, model, resume_id=None)
 
     # Get the raw dataset
     raw_datasets = get_raw_dataset(args)
@@ -430,12 +515,15 @@ def main():
         eval_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size
     )
 
+    # Prepare loss function
+    criterion = SoftQLearningCriterion(1, args.label_smoothing)
+
     # Prepare optimizer
     optimizer = setup_optimizer(args, model)
 
     # Prepare everything with our `accelerator`.
-    model, optimizer, train_dataloader, eval_dataloader = accelerator.prepare(
-        model, optimizer, train_dataloader, eval_dataloader
+    model, tgt_model, optimizer, train_dataloader, eval_dataloader = accelerator.prepare(
+        model, tgt_model, optimizer, train_dataloader, eval_dataloader
     )
 
     # Note -> the training dataloader needs to be prepared before we grab his length below (cause its length will be
@@ -472,11 +560,43 @@ def main():
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
     completed_steps = 0
 
+    def polyak_update(model, model_, target_lr=0.001):
+        for param_, param in zip(model_.parameters(), model.parameters()):
+            param_.data.copy_((1 - target_lr) * param_ + target_lr * param)
+
     for epoch in range(args.num_train_epochs):
         model.train()
         for step, batch in enumerate(train_dataloader):
-            outputs = model(**batch)
-            loss = outputs.loss
+            """
+            batch: {
+                attention_mask: [batch_size, src_length]
+                input_ids: [batch_size, src_length]
+                labels: [batch_size, tgt_length]
+                decoder_input_ids: [batch_size, tgt_length]
+            }
+            """
+            outputs = model(
+                input_ids=batch.input_ids,
+                attention_mask=batch.attention_mask,
+                decoder_input_ids=batch.decoder_input_ids,
+            )
+            with torch.no_grad():
+                tgt_outputs = tgt_model(
+                    input_ids=batch.input_ids,
+                    attention_mask=batch.attention_mask,
+                    decoder_input_ids=batch.decoder_input_ids,
+                )
+
+            # replace -100 with 1
+            pad_mask = batch.labels.eq(-100)
+            target = batch.labels.masked_fill(pad_mask, 0.0)
+
+            sample = {
+                'target': target,
+                'rewards': torch.ones([batch.labels.shape[0]]).to(outputs[0])
+            }
+
+            loss = criterion(outputs[0], tgt_outputs[0], sample)[0]
             loss = loss / args.gradient_accumulation_steps
             accelerator.backward(loss)
             if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
@@ -485,6 +605,17 @@ def main():
                 optimizer.zero_grad()
                 progress_bar.update(1)
                 completed_steps += 1
+
+                # update target model
+                polyak_update(model, tgt_model)
+
+                # W&B logging
+                if accelerator.is_main_process:
+                    report_metrics(
+                        lr_scheduler.get_last_lr(),
+                        loss.item(),
+                        completed_steps
+                    )
 
             if completed_steps >= args.max_train_steps:
                 break
@@ -499,6 +630,10 @@ def main():
         result = {k: round(v, 4) for k, v in result.items()}
 
         logger.info(result)
+
+        if accelerator.is_main_process and _has_wandb:
+            log_info = {"Validation/" + k: v for k, v in result.items()}
+            wandb.log(log_info, completed_steps)
 
     if args.output_dir is not None:
         accelerator.wait_for_everyone()

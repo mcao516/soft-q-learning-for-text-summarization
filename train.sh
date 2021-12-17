@@ -22,20 +22,22 @@ fi
 
 
 MODEL_NAME_OR_PATH=$SCRATCH/huggingface/bart-base
-OUTPUT_DIR=$SCRATCH/BART_base_xsum_test
+OUTPUT_DIR=$SCRATCH/BART_base_xsum_soft_q
 
+CUDA_LAUNCH_BLOCKING=1
 accelerate launch run_summarization_no_trainer.py \
+    --job_name first_run \
+    --project_name summarization-soft-q \
     --model_name_or_path $MODEL_NAME_OR_PATH \
     --dataset_name xsum \
-    --per_device_train_batch_size 8 \
+    --per_device_train_batch_size 6 \
     --per_device_eval_batch_size 8 \
     --preprocessing_num_workers 16 \
     --num_warmup_steps 500 \
     --learning_rate 5e-5 \
-    --gradient_accumulation_steps 2 \
+    --gradient_accumulation_steps 1 \
     --num_beams 6 \
     --num_train_epochs 6 \
-    --overwrite_cache false \
     --output_dir $OUTPUT_DIR;
     # --source_prefix "summarize: " \
     # --dataset_config "3.0.0" \
