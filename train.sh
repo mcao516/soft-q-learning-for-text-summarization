@@ -13,7 +13,7 @@ else
 
     if [ ${HOSTNAME:0:3} = "blg" ]; then
         source $SCRATCH/envABERT/bin/activate
-    elif [ ${HOSTNAME:0:2} = "ng" ] || [ ${HOSTNAME:0:3} = "cdr" ]; then
+    elif [ ${HOSTNAME:0:2} = "ng" ] || [ ${HOSTNAME:0:3} = "cdr" ] || [ ${HOSTNAME:0:2} = "na" ]; then
         source $HOME/envABERT/bin/activate
     else
         echo "Unknown cluster!!!"
@@ -21,7 +21,7 @@ else
 fi
 
 
-MODEL_NAME_OR_PATH=$SCRATCH/huggingface/bart-base
+MODEL_NAME_OR_PATH=$SCRATCH/huggingface/bart-large-xsum
 OUTPUT_DIR=$SCRATCH/BART_base_xsum_soft_q
 
 CUDA_LAUNCH_BLOCKING=1

@@ -414,6 +414,43 @@ def eval(args, accelerator, model, tokenizer, eval_dataloader, metric):
             metric.add_batch(predictions=decoded_preds, references=decoded_labels)
 
 
+def generate(
+    args,
+    accelerator,
+    model,
+    tokenizer,
+    batch,
+    do_sample=False
+    ):
+    model.eval()
+    if args.val_max_target_length is None:
+        args.val_max_target_length = args.max_target_length
+
+    gen_kwargs = {
+        "max_length": args.val_max_target_length if args is not None else config.max_length,
+        "num_beams": args.num_beams,
+    }
+
+    with torch.no_grad():
+        generated_tokens = accelerator.unwrap_model(model).generate(
+            batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            **gen_kwargs,
+            do_sample=do_sample,
+        )
+
+        generated_tokens = accelerator.pad_across_processes(
+            generated_tokens, dim=1, pad_index=tokenizer.pad_token_id
+        )
+
+        generated_tokens = accelerator.gather(generated_tokens).cpu().numpy()
+        if isinstance(generated_tokens, tuple):
+            generated_tokens = generated_tokens[0]
+
+        decoded_preds = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
+        return generated_tokens, decoded_preds
+
+
 def main():
     args = parse_args()
 
@@ -575,6 +612,23 @@ def main():
                 decoder_input_ids: [batch_size, tgt_length]
             }
             """
+            if step % 2 == 0: # learning from demonstration
+                generated_tokens, decoded_preds = generate(
+                    args,
+                    accelerator,
+                    model,
+                    tokenizer,
+                    batch
+                )
+
+                print('generated tokens:')
+                print(generated_tokens)
+                print('decoder input ids')
+                print(batch.decoder_input_ids)
+                exit()
+            else:
+                pass
+
             outputs = model(
                 input_ids=batch.input_ids,
                 attention_mask=batch.attention_mask,
@@ -592,7 +646,7 @@ def main():
             target = batch.labels.masked_fill(pad_mask, 0.0)
 
             sample = {
-                'target': target,
+                'target': generated_tokens,
                 'rewards': torch.ones([batch.labels.shape[0]]).to(outputs[0])
             }
 
