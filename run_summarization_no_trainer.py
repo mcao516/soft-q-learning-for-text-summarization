@@ -421,7 +421,7 @@ def generate(
     tokenizer,
     batch,
     do_sample=False
-    ):
+):
     model.eval()
     if args.val_max_target_length is None:
         args.val_max_target_length = args.max_target_length
@@ -443,11 +443,11 @@ def generate(
             generated_tokens, dim=1, pad_index=tokenizer.pad_token_id
         )
 
-        generated_tokens = accelerator.gather(generated_tokens).cpu().numpy()
-        if isinstance(generated_tokens, tuple):
-            generated_tokens = generated_tokens[0]
+        generated_tokens_np = accelerator.gather(generated_tokens).cpu().numpy()
+        if isinstance(generated_tokens_np, tuple):
+            generated_tokens_np = generated_tokens_np[0]
 
-        decoded_preds = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
+        decoded_preds = tokenizer.batch_decode(generated_tokens_np, skip_special_tokens=True)
         return generated_tokens, decoded_preds
 
 
@@ -612,7 +612,7 @@ def main():
                 decoder_input_ids: [batch_size, tgt_length]
             }
             """
-            if step % 2 == 0: # learning from demonstration
+            if False: 
                 generated_tokens, decoded_preds = generate(
                     args,
                     accelerator,
@@ -620,39 +620,39 @@ def main():
                     tokenizer,
                     batch
                 )
+                # [batch_size, tgt_length]
+                labels = torch.zeros_like(generated_tokens)
+                labels[:, 1:] = generated_tokens[:, 1:]
 
-                print('generated tokens:')
-                print(generated_tokens)
-                print('decoder input ids')
-                print(batch.decoder_input_ids)
-                exit()
-            else:
-                pass
+                decoder_input_ids = torch.zeros_like(generated_tokens)
+                decoder_input_ids[:, 1:] = labels[:, :-1]
+                decoder_input_ids[:, 0] = 2
+
+            else: # learning from demonstration
+                pad_mask = batch.labels.eq(-100) # replace -100 with 1
+                labels = batch.labels.masked_fill(pad_mask, 1)
+                decoder_input_ids = batch.decoder_input_ids
 
             outputs = model(
                 input_ids=batch.input_ids,
                 attention_mask=batch.attention_mask,
-                decoder_input_ids=batch.decoder_input_ids,
+                decoder_input_ids=decoder_input_ids,
             )
             with torch.no_grad():
                 tgt_outputs = tgt_model(
                     input_ids=batch.input_ids,
                     attention_mask=batch.attention_mask,
-                    decoder_input_ids=batch.decoder_input_ids,
+                    decoder_input_ids=decoder_input_ids,
                 )
 
-            # replace -100 with 1
-            pad_mask = batch.labels.eq(-100)
-            target = batch.labels.masked_fill(pad_mask, 0.0)
-
             sample = {
-                'target': generated_tokens,
-                'rewards': torch.ones([batch.labels.shape[0]]).to(outputs[0])
+                'target': labels,
+                'rewards': torch.ones([labels.shape[0]]).to(outputs[0])
             }
-
             loss = criterion(outputs[0], tgt_outputs[0], sample)[0]
             loss = loss / args.gradient_accumulation_steps
             accelerator.backward(loss)
+            
             if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
                 optimizer.step()
                 lr_scheduler.step()
