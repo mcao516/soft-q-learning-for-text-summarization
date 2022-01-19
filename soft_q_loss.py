@@ -477,9 +477,6 @@ class SoftQLearningCriterion(nn.Module):
         tgt_lengths = self.get_tgt_lengths(target)
         assert tgt_lengths.dim() == 1 and tgt_lengths.shape[0] == target.shape[0]
 
-        print(target[0])
-        print(tgt_lengths[0])
-
         rewards = None
         if sample.get('rewards', None) is not None:
             rewards = sample['rewards']
