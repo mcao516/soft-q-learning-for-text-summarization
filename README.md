@@ -1,7 +1,7 @@
 # Soft Q-Learning for Text Summarization
 
 PyTorch & Huggingface implementation of [Text Generation with Efficient (Soft) Q-Learning](https://arxiv.org/abs/2106.07704).
-Support multi-gpu training.
+Support multi-GPU training.
 
 # Requirements
 Please see `requirements.txt` for detailed dependencies. The major ones include:
