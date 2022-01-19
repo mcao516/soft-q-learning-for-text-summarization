@@ -1,0 +1,8 @@
+accelerate==0.5.1
+datasets==1.16.1
+numpy==1.21.4
+rouge-score==0.0.4
+torch==1.7.1+cu110
+tqdm==4.62.3
+transformers==4.12.5
+wandb==0.12.7
