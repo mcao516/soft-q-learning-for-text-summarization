@@ -21,19 +21,19 @@ else
 fi
 
 
-MODEL_NAME_OR_PATH=$SCRATCH/huggingface/bart-large-xsum
-OUTPUT_DIR=$SCRATCH/BART_base_xsum_soft_q
+MODEL_NAME_OR_PATH=$SCRATCH/huggingface/bart-base
+OUTPUT_DIR=$SCRATCH/BART_base_xsum_soft_q_50sampling
 
 CUDA_LAUNCH_BLOCKING=1
-accelerate launch run_summarization_no_trainer.py \
-    --job_name first_run \
+accelerate launch --config_file gpu_3_config.yaml run_summarization_no_trainer.py \
+    --job_name bart-base-50sampling \
     --project_name summarization-soft-q \
     --model_name_or_path $MODEL_NAME_OR_PATH \
     --dataset_name xsum \
-    --per_device_train_batch_size 6 \
-    --per_device_eval_batch_size 8 \
+    --per_device_train_batch_size 12 \
+    --per_device_eval_batch_size 12 \
     --preprocessing_num_workers 16 \
-    --num_warmup_steps 500 \
+    --num_warmup_steps 1000 \
     --learning_rate 5e-5 \
     --gradient_accumulation_steps 1 \
     --num_beams 6 \

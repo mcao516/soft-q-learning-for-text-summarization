@@ -36,6 +36,7 @@ from transformers import (
 )
 from transformers.file_utils import is_offline_mode
 from transformers.utils.versions import require_version
+from rouge_score import rouge_scorer
 
 from soft_q_loss import SoftQLearningCriterion
 from data_utils import get_raw_dataset, process_raw_dataset, postprocess_text
@@ -421,14 +422,14 @@ def generate(
     tokenizer,
     batch,
     do_sample=False
-    ):
+):
     model.eval()
     if args.val_max_target_length is None:
         args.val_max_target_length = args.max_target_length
 
     gen_kwargs = {
         "max_length": args.val_max_target_length if args is not None else config.max_length,
-        "num_beams": args.num_beams,
+        "num_beams": 1,
     }
 
     with torch.no_grad():
@@ -439,16 +440,50 @@ def generate(
             do_sample=do_sample,
         )
 
-        generated_tokens = accelerator.pad_across_processes(
-            generated_tokens, dim=1, pad_index=tokenizer.pad_token_id
+    return generated_tokens
+
+
+def decode_ids_to_strs(
+    args,
+    labels,
+    accelerator,
+    tokenizer
+):
+    if not args.pad_to_max_length:
+        # If we did not pad to max length, we need to pad the labels too
+        labels = accelerator.pad_across_processes(
+            labels, dim=1, pad_index=tokenizer.pad_token_id
         )
+    
+    labels = labels.cpu().numpy()
 
-        generated_tokens = accelerator.gather(generated_tokens).cpu().numpy()
-        if isinstance(generated_tokens, tuple):
-            generated_tokens = generated_tokens[0]
+    if args.ignore_pad_token_for_loss:
+        # Replace -100 in the labels as we can't decode them.
+        labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
 
-        decoded_preds = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
-        return generated_tokens, decoded_preds
+    decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
+    return decoded_labels
+
+
+def calculate_rouge(args, decoded_preds, decoded_labels):
+    assert len(decoded_preds) == len(decoded_labels), \
+        "predicts: {}; references: {}".format(len(decoded_preds), len(decoded_labels))
+    scorer = rouge_scorer.RougeScorer(['rouge1', 'rougeL'], use_stemmer=True)
+
+    rouge_scores, rewards, length_rewards = [], [], []
+    for r, p in zip(decoded_labels, decoded_preds):
+        rouge = scorer.score(r, p)
+        rouge_scores.append(rouge)
+
+        reward = rouge['rouge1'].fmeasure
+        # if args.length_reward:
+        #     length_reward = 1.0 if len(p) <= len(r) else 0.0
+        #     reward += length_reward
+        #     length_rewards.append(length_reward)
+
+        rewards.append(reward)
+
+    return rewards
 
 
 def main():
@@ -612,47 +647,52 @@ def main():
                 decoder_input_ids: [batch_size, tgt_length]
             }
             """
-            if step % 2 == 0: # learning from demonstration
-                generated_tokens, decoded_preds = generate(
+            if step % 2 == 0: 
+                generated_tokens = generate(
                     args,
                     accelerator,
                     model,
                     tokenizer,
-                    batch
+                    batch,
+                    do_sample=True
                 )
 
-                print('generated tokens:')
-                print(generated_tokens)
-                print('decoder input ids')
-                print(batch.decoder_input_ids)
-                exit()
-            else:
-                pass
+                # [batch_size, tgt_length]
+                labels = torch.zeros_like(generated_tokens)
+                labels[:, 1:] = generated_tokens[:, 1:]
+
+                decoder_input_ids = torch.zeros_like(generated_tokens)
+                decoder_input_ids[:, 1:] = labels[:, :-1]
+                decoder_input_ids[:, 0] = 2
+
+            else: # learning from demonstration
+                pad_mask = batch.labels.eq(-100) # replace -100 with 1
+                labels = batch.labels.masked_fill(pad_mask, 1)
+                decoder_input_ids = batch.decoder_input_ids
 
             outputs = model(
                 input_ids=batch.input_ids,
                 attention_mask=batch.attention_mask,
-                decoder_input_ids=batch.decoder_input_ids,
+                decoder_input_ids=decoder_input_ids,
             )
             with torch.no_grad():
                 tgt_outputs = tgt_model(
                     input_ids=batch.input_ids,
                     attention_mask=batch.attention_mask,
-                    decoder_input_ids=batch.decoder_input_ids,
+                    decoder_input_ids=decoder_input_ids,
                 )
 
-            # replace -100 with 1
-            pad_mask = batch.labels.eq(-100)
-            target = batch.labels.masked_fill(pad_mask, 0.0)
+            # reward calculation
+            decoded_labels = decode_ids_to_strs(args, batch.labels, accelerator, tokenizer)
+            decoded_preds = decode_ids_to_strs(args, labels, accelerator, tokenizer)
+            rewards = calculate_rouge(args, decoded_preds, decoded_labels)
+            rewards = torch.tensor(rewards).to(outputs[0])
 
-            sample = {
-                'target': generated_tokens,
-                'rewards': torch.ones([batch.labels.shape[0]]).to(outputs[0])
-            }
-
+            sample = {'target': labels, 'rewards': rewards}
             loss = criterion(outputs[0], tgt_outputs[0], sample)[0]
             loss = loss / args.gradient_accumulation_steps
             accelerator.backward(loss)
+            
             if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
                 optimizer.step()
                 lr_scheduler.step()
